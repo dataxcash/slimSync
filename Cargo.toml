@@ -24,6 +24,11 @@ jwalk = "0.8"
 # 线程间通信
 crossbeam-channel = "0.5"
 
+# Linux fanotify (仅 Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["fanotify"] }
+libc = "0.2"
+
 # 内核事件通知
 notify = "6"
 

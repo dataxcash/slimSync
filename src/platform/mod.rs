@@ -33,3 +33,16 @@ pub use macos::MacosScanner as PlatformScannerImpl;
 /// 兜底：未知平台使用通用 walkdir
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub use fallback::FallbackScanner as PlatformScannerImpl;
+
+// ============================================================
+// 运行时跟踪器
+// ============================================================
+pub mod tracker;
+#[cfg(target_os = "linux")]
+mod linux_tracker;
+#[cfg(target_os = "linux")]
+pub use linux_tracker::LinuxTracker as PlatformTrackerImpl;
+#[cfg(not(target_os = "linux"))]
+mod notify_tracker;
+#[cfg(not(target_os = "linux"))]
+pub use notify_tracker::NotifyTracker as PlatformTrackerImpl;
