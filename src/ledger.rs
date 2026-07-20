@@ -91,12 +91,26 @@ impl LocalLedger {
         Ok(())
     }
 
-    /// 冷启动差分：与当前文件系统快照比对，计算出三份变化清单
-    pub fn compute_delta_manifests(
-        &mut self,
-        current_scan: &[ScanItem],
-    ) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
-        // 创建临时表装载当前扫描结果
+    /// 批量插入扫描结果到临时表（供 producer-consumer 模式使用）
+    pub fn batch_insert_temp_scan(&mut self, batch: &[ScanItem]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO temp_scan (file_path, mtime_ns, file_size, st_dev, st_ino)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
+            for item in batch {
+                stmt.execute(params![
+                    item.file_path, item.mtime_ns, item.file_size,
+                    item.st_dev, item.st_ino,
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// 初始化临时表
+    pub fn init_temp_scan(&mut self) -> Result<()> {
         self.conn.execute("
             CREATE TEMP TABLE IF NOT EXISTS temp_scan (
                 file_path TEXT PRIMARY KEY,
@@ -107,17 +121,13 @@ impl LocalLedger {
             );
         ", [])?;
         self.conn.execute("DELETE FROM temp_scan;", [])?;
+        Ok(())
+    }
 
-        // 批量插入
-        let tx = self.conn.transaction()?;
-        for item in current_scan {
-            tx.execute(
-                "INSERT INTO temp_scan (file_path, mtime_ns, file_size, st_dev, st_ino)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![item.file_path, item.mtime_ns, item.file_size, item.st_dev, item.st_ino],
-            )?;
-        }
-        tx.commit()?;
+    /// 冷启动差分：从已填充的 temp_scan 计算出三份变化清单
+    pub fn compute_delta_manifests(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
 
         // 新增文件
         let mut new_files = Vec::new();

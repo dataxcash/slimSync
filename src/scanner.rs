@@ -1,6 +1,9 @@
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
-use walkdir::WalkDir;
+use std::sync::Arc;
+use crossbeam_channel::bounded;
+
+use crate::ledger::LocalLedger;
+use crate::platform::PlatformScanner;
 
 #[derive(Debug, Clone)]
 pub struct ScanItem {
@@ -11,48 +14,47 @@ pub struct ScanItem {
     pub st_ino: u64,
 }
 
-/// 多线程遍历监控目录，只读 VFS 元数据（stat），不读文件内容
-pub fn scan_monitored_directories(dirs: &[PathBuf]) -> Vec<ScanItem> {
-    let mut items = Vec::new();
-    for dir in dirs {
-        if !dir.exists() {
-            tracing::warn!("scan directory does not exist: {:?}", dir);
-            continue;
-        }
-        for entry in WalkDir::new(dir)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
+/// 并行扫描 + 批量入库
+/// 使用 jwalk 多线程遍历，通过 channel 批量（每 BATCH_SIZE 条）写入 SQLite
+pub fn batch_scan(
+    scanner: Arc<dyn PlatformScanner>,
+    dirs: &[PathBuf],
+    ledger: &mut LocalLedger,
+) -> Result<(), String> {
+    const BATCH_SIZE: usize = 5000;
+
+    let (tx, rx) = bounded::<ScanItem>(BATCH_SIZE * 2);
+
+    // 生产者：jwalk 多线程扫描
+    let dirs_owned: Vec<PathBuf> = dirs.iter().cloned().collect();
+    let scan_handle = std::thread::spawn(move || {
+        scanner.fast_scan(&dirs_owned, tx)
+            .map_err(|e| e.to_string())
+    });
+
+    // 消费者：批量写入 SQLite 临时表
+    let mut batch: Vec<ScanItem> = Vec::with_capacity(BATCH_SIZE);
+    loop {
+        match rx.recv() {
+            Ok(item) => {
+                batch.push(item);
+                if batch.len() >= BATCH_SIZE {
+                    ledger.batch_insert_temp_scan(&batch)
+                        .map_err(|e| e.to_string())?;
+                    batch.clear();
+                }
             }
-            if let Ok(meta) = entry.metadata() {
-                #[cfg(unix)]
-                use std::os::unix::fs::MetadataExt;
-
-                let mtime_ns = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0);
-
-                items.push(ScanItem {
-                    file_path: entry.path().to_string_lossy().into_owned(),
-                    mtime_ns,
-                    file_size: meta.len() as i64,
-                    #[cfg(unix)]
-                    st_dev: meta.dev(),
-                    #[cfg(unix)]
-                    st_ino: meta.ino(),
-                    #[cfg(not(unix))]
-                    st_dev: 0,
-                    #[cfg(not(unix))]
-                    st_ino: 0,
-                });
+            Err(_) => {
+                if !batch.is_empty() {
+                    ledger.batch_insert_temp_scan(&batch)
+                        .map_err(|e| e.to_string())?;
+                }
+                break;
             }
         }
     }
-    items
+
+    scan_handle.join().map_err(|_| "scan thread panicked".to_string())?
+        .map_err(|e| format!("scan failed: {}", e))?;
+    Ok(())
 }

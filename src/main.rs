@@ -1,6 +1,7 @@
 mod config;
 mod ledger;
 mod scanner;
+mod platform;
 mod tracker;
 mod slicer;
 mod crypto;
@@ -9,6 +10,7 @@ mod bus;
 use std::sync::Arc;
 use std::path::Path;
 use tokio::signal;
+use crate::platform::PlatformScanner;
 
 #[tokio::main]
 async fn main() {
@@ -45,16 +47,28 @@ async fn main() {
     );
     tracing::info!("zenoh bus: {}", if bus.is_online() { "online" } else { "offline (local-only)" });
 
-    // 5. 冷启动：扫描目录，差分变化清单，执行增量装弹
-    tracing::info!("cold start: scanning monitored directories...");
-    let scan_result = scanner::scan_monitored_directories(&cfg.watch.dirs);
+    // 5. 冷启动：平台特异性并行扫描 + 批量入库 + SQL 差分
+    tracing::info!("cold start: scanning with {}", platform::PlatformScannerImpl.name());
+    {
+        let mut guard = ledger.lock().unwrap();
+        guard.init_temp_scan().expect("failed to init temp_scan");
+    }
+    // 并行扫描，通过 channel 批量写入 temp_scan
+    {
+        let scanner: Arc<dyn PlatformScanner> = Arc::new(platform::PlatformScannerImpl);
+        let mut guard = ledger.lock().unwrap();
+        scanner::batch_scan(scanner, &cfg.watch.dirs, &mut guard)
+            .expect("failed to batch scan");
+    }
+    // SQL 差分出三份变化清单
     let delta = {
         let mut guard = ledger.lock().unwrap();
-        guard.compute_delta_manifests(&scan_result)
+        guard.compute_delta_manifests()
             .expect("failed to compute delta manifests")
     };
     tracing::info!(
-        "cold start: new={}, modified={}, deleted={}",
+        "cold start: platform={}, new={}, modified={}, deleted={}",
+        platform::PlatformScannerImpl.name(),
         delta.0.len(), delta.1.len(), delta.2.len(),
     );
 
