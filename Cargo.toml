@@ -1,0 +1,42 @@
+[package]
+name = "slimsync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 共享契约
+slim-common = { path = "../slim-common" }
+
+# 异步运行时
+tokio = { version = "1", features = ["full", "signal"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 本地账本
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# 文件扫描
+walkdir = "2"
+
+# 内核事件通知
+notify = "6"
+
+# 哈希与加密
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+# Zenoh
+zenoh = { version = "1.0.0" }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
