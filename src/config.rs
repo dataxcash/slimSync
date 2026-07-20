@@ -34,6 +34,19 @@ pub struct ZenohConfig {
     pub timeout_ms: u64,
 }
 
+impl WatchConfig {
+    /// 检查文件路径是否匹配排除模式
+    pub fn is_excluded(&self, path: &str) -> bool {
+        self.exclude_patterns.iter().any(|p| {
+            if let Ok(pat) = glob::Pattern::new(p) {
+                pat.matches(path)
+            } else {
+                path.contains(p)
+            }
+        })
+    }
+}
+
 pub fn load() -> Result<Config, Box<dyn std::error::Error>> {
     let config_path = std::env::var("SLIMSYNC_CONFIG")
         .unwrap_or_else(|_| "slimsync.toml".into());

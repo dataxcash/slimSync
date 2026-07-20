@@ -1,0 +1,24 @@
+[general]
+log_level = "info"
+
+[watch]
+dirs = [
+    "/data/projects",
+    "/var/log/app"
+]
+debounce_ms = 200
+exclude = ["*.tmp", "*.swp", ".git/**", "node_modules/**", "target/**"]
+
+[crypto]
+key_file = "/etc/slimsync/key.bin"
+salt_file = "/etc/slimsync/salt.bin"
+
+[storage]
+db_path = "/var/lib/slimsync/slimsync.db"
+
+[zenoh]
+mode = "client"
+connect = [
+    "tcp/127.0.0.1:7447"
+]
+timeout_ms = 5000
