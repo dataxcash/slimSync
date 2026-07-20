@@ -528,24 +528,26 @@ OS 内核事件流 (高频 Modify)
 
 ---
 
-## 十一、接口契约：/schema/ 共享目录
+## 十一、接口契约：slim-common 共享 crate
 
-slimSync 作为三驾马车之一，与 slimHub / slimRagSvr 的通信协议在项目根 `/schema/` 目录单源定义：
+slimSync 与 slimHub / slimRagSvr 之间的通信类型和主题常量，由工作空间内的 `slim-common/` crate 单源定义。
 
 ```
 slimRAG/
-├── schema/
-│   ├── proto/
-│   │   ├── chunk_message.proto     # ChunkMessage, StructureHint
-│   │   ├── file_metadata.proto     # FileMetadata
-│   │   └── audit.proto             # 审计对账协议
-│   └── TOPICS.md                   # Zenoh 主题命名空间正式定义
-├── slimSync/     ← 通过符号链接 / git submodule 引入 schema/
-├── slimHub/
-└── slimRagSvr/
+├── slim-common/        ← 三模块共享的 Rust crate
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── types.rs    ← ChunkMessage, FileMetadata, AuditQuery 等 struct
+│       └── topics.rs   ← Zenoh 主题常量（编译期对齐）
+├── slimSync/           ← 依赖 slim-common
+├── slimHub/            ← 依赖 slim-common
+└── slimRagSvr/         ← 依赖 slim-common
 ```
 
-任何对消息字段或主题路径的修改，必须在 `/schema/` 中先修改，三个子项目同步更新，保证编译期字段绝对对齐。
+- 序列化使用 `serde + postcard`，零外部工具链依赖
+- 任何字段或主题路径的修改，编辑 `slim-common/src/types.rs` / `topics.rs` 即可
+- 三模块修改后立即编译报错，保证编译期字段绝对对齐
 
 ---
 
