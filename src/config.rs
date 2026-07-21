@@ -35,7 +35,6 @@ pub struct ZenohConfig {
 }
 
 impl WatchConfig {
-    /// 检查文件路径是否匹配排除模式
     pub fn is_excluded(&self, path: &str) -> bool {
         self.exclude_patterns.iter().any(|p| {
             if let Ok(pat) = glob::Pattern::new(p) {
@@ -47,10 +46,11 @@ impl WatchConfig {
     }
 }
 
-pub fn load() -> Result<Config, Box<dyn std::error::Error>> {
-    let config_path = std::env::var("SLIMSYNC_CONFIG")
-        .unwrap_or_else(|_| "slimsync.toml".into());
-    let content = std::fs::read_to_string(&config_path)?;
+pub fn load(config_path: Option<String>) -> Result<Config, Box<dyn std::error::Error>> {
+    let path = config_path
+        .or_else(|| std::env::var("SLIMSYNC_CONFIG").ok())
+        .unwrap_or_else(|| "slimsync.toml".into());
+    let content = std::fs::read_to_string(&path)?;
     let raw: toml::Value = toml::from_str(&content)?;
 
     Ok(Config {
@@ -70,7 +70,7 @@ pub fn load() -> Result<Config, Box<dyn std::error::Error>> {
         crypto: CryptoConfig {
             key_file: raw["crypto"]["key_file"].as_str()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/etc/slimsync/key. age")),
+                .unwrap_or_else(|| PathBuf::from("/etc/slimsync/key.age")),
             salt_file: raw["crypto"]["salt_file"].as_str()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/etc/slimsync/salt.bin")),
