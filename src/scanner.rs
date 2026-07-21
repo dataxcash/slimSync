@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use crossbeam_channel::bounded;
 
 use crate::ledger::LocalLedger;
@@ -33,9 +34,11 @@ pub fn batch_scan(
     });
 
     // 消费者：批量写入 SQLite 临时表
+    // 每 BATCH_SIZE 条或 500ms 超时强制提交，防止进程 kill 导致通道内数据蒸发
     let mut batch: Vec<ScanItem> = Vec::with_capacity(BATCH_SIZE);
+    const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
     loop {
-        match rx.recv() {
+        match rx.recv_timeout(FLUSH_INTERVAL) {
             Ok(item) => {
                 batch.push(item);
                 if batch.len() >= BATCH_SIZE {
@@ -44,7 +47,16 @@ pub fn batch_scan(
                     batch.clear();
                 }
             }
-            Err(_) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // 超时强制 flush：最多丢失一个 FLUSH_INTERVAL 窗口的数据
+                if !batch.is_empty() {
+                    ledger.batch_insert_temp_scan(&batch)
+                        .map_err(|e| e.to_string())?;
+                    batch.clear();
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // 生产者已退出，最后一次 flush
                 if !batch.is_empty() {
                     ledger.batch_insert_temp_scan(&batch)
                         .map_err(|e| e.to_string())?;
