@@ -86,7 +86,11 @@ impl Bus {
             )?;
         }
         if let Some(session) = &self.session {
-            let topic = format!("{}/{}", slim_common::topics::CHUNK_PREFIX, hex::encode(&blind_id));
+            let topic = format!(
+                "{}/{}",
+                slim_common::topics::CHUNK_PREFIX,
+                hex::encode(blind_id)
+            );
             let _ = session.put(topic, cipher).await;
         }
         Ok(blind_id)
@@ -103,7 +107,9 @@ impl Bus {
         let chunks = slicer::slice_file(path, start_offset);
         let mut last_offset = start_offset;
         for chunk in &chunks {
-            let _blind_id = self.send_chunk(ledger, file_path, &chunk.data, chunk.offset).await?;
+            let _blind_id = self
+                .send_chunk(ledger, file_path, &chunk.data, chunk.offset)
+                .await?;
             last_offset = chunk.offset + chunk.length;
         }
         Ok(last_offset)

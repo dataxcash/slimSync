@@ -1,7 +1,7 @@
+use crossbeam_channel::bounded;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use crossbeam_channel::bounded;
 
 use crate::ledger::LocalLedger;
 use crate::platform::PlatformScanner;
@@ -27,9 +27,10 @@ pub fn batch_scan(
     let (tx, rx) = bounded::<ScanItem>(BATCH_SIZE * 2);
 
     // 生产者：jwalk 多线程扫描
-    let dirs_owned: Vec<PathBuf> = dirs.iter().cloned().collect();
+    let dirs_owned: Vec<PathBuf> = dirs.to_vec();
     let scan_handle = std::thread::spawn(move || {
-        scanner.fast_scan(&dirs_owned, tx)
+        scanner
+            .fast_scan(&dirs_owned, tx)
             .map_err(|e| e.to_string())
     });
 
@@ -42,7 +43,8 @@ pub fn batch_scan(
             Ok(item) => {
                 batch.push(item);
                 if batch.len() >= BATCH_SIZE {
-                    ledger.batch_insert_temp_scan(&batch)
+                    ledger
+                        .batch_insert_temp_scan(&batch)
                         .map_err(|e| e.to_string())?;
                     batch.clear();
                 }
@@ -50,7 +52,8 @@ pub fn batch_scan(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // 超时强制 flush：最多丢失一个 FLUSH_INTERVAL 窗口的数据
                 if !batch.is_empty() {
-                    ledger.batch_insert_temp_scan(&batch)
+                    ledger
+                        .batch_insert_temp_scan(&batch)
                         .map_err(|e| e.to_string())?;
                     batch.clear();
                 }
@@ -58,7 +61,8 @@ pub fn batch_scan(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 // 生产者已退出，最后一次 flush
                 if !batch.is_empty() {
-                    ledger.batch_insert_temp_scan(&batch)
+                    ledger
+                        .batch_insert_temp_scan(&batch)
                         .map_err(|e| e.to_string())?;
                 }
                 break;
@@ -66,7 +70,9 @@ pub fn batch_scan(
         }
     }
 
-    scan_handle.join().map_err(|_| "scan thread panicked".to_string())?
+    scan_handle
+        .join()
+        .map_err(|_| "scan thread panicked".to_string())?
         .map_err(|e| format!("scan failed: {}", e))?;
     Ok(())
 }

@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
-use nix::sys::fanotify::{Fanotify, InitFlags, EventFFlags, MarkFlags, MaskFlags};
+use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
 
 use super::tracker::{FileChangeEvent, FileChangeKind, PlatformTracker};
 
@@ -28,7 +28,11 @@ impl LinuxTracker {
 
 impl PlatformTracker for LinuxTracker {
     fn name(&self) -> &'static str {
-        if self.use_fanotify { "linux-fanotify" } else { "linux-inotify" }
+        if self.use_fanotify {
+            "linux-fanotify"
+        } else {
+            "linux-inotify"
+        }
     }
 
     fn start_watching(
@@ -61,8 +65,7 @@ fn start_fanotify(
         if dir.exists() {
             fan.mark(
                 MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_MOUNT,
-                MaskFlags::FAN_MODIFY | MaskFlags::FAN_CREATE
-                    | MaskFlags::FAN_DELETE,
+                MaskFlags::FAN_MODIFY | MaskFlags::FAN_CREATE | MaskFlags::FAN_DELETE,
                 None::<i32>,
                 Some(dir.as_path()),
             )?;
@@ -70,21 +73,19 @@ fn start_fanotify(
         }
     }
 
-    thread::spawn(move || {
-        loop {
-            match fan.read_events() {
-                Ok(events) => {
-                    for _ev in &events {
-                        let _ = sender.send(FileChangeEvent {
-                            file_path: String::new(),
-                            event_kind: FileChangeKind::Modified,
-                        });
-                    }
+    thread::spawn(move || loop {
+        match fan.read_events() {
+            Ok(events) => {
+                for _ev in &events {
+                    let _ = sender.send(FileChangeEvent {
+                        file_path: String::new(),
+                        event_kind: FileChangeKind::Modified,
+                    });
                 }
-                Err(e) => {
-                    tracing::error!("fanotify read error: {:?}", e);
-                    thread::sleep(Duration::from_secs(1));
-                }
+            }
+            Err(e) => {
+                tracing::error!("fanotify read error: {:?}", e);
+                thread::sleep(Duration::from_secs(1));
             }
         }
     });

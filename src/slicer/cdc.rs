@@ -1,6 +1,6 @@
+use crate::slicer::Chunk;
 use std::fs;
 use std::path::Path;
-use crate::slicer::Chunk;
 
 // FastCDC 参数
 const MIN_CHUNK: u64 = 2048;
@@ -30,10 +30,7 @@ pub fn fastcdc_chunk(file_path: &Path, start_offset: u64) -> Vec<Chunk> {
 
     while pos < data.len() {
         let chunk_start = pos;
-        let chunk_end = std::cmp::min(
-            chunk_start + MAX_CHUNK as usize,
-            data.len(),
-        );
+        let chunk_end = std::cmp::min(chunk_start + MAX_CHUNK as usize, data.len());
 
         for i in pos..chunk_end {
             hash = hash.wrapping_shl(1).wrapping_add(gear_hash(data[i]));

@@ -58,14 +58,13 @@ pub struct FileTracker {
 
 impl FileTracker {
     pub fn new(watch_cfg: WatchConfig, debounce_ms: u64) -> Self {
-        FileTracker { watch_cfg, debounce_ms }
+        FileTracker {
+            watch_cfg,
+            debounce_ms,
+        }
     }
 
-    pub async fn run(
-        self,
-        ledger: Arc<Mutex<LocalLedger>>,
-        bus: Arc<Bus>,
-    ) {
+    pub async fn run(self, ledger: Arc<Mutex<LocalLedger>>, bus: Arc<Bus>) {
         let (tx, mut rx) = mpsc::unbounded_channel::<crate::platform::tracker::FileChangeEvent>();
 
         // 启动平台特异性跟踪器
@@ -116,17 +115,14 @@ impl FileTracker {
 
                             let (last_offset, st_dev, st_ino) = {
                                 let guard = ledger.lock().unwrap();
-                                let mut stmt = guard.conn.prepare(
+                                let stmt = guard.conn.prepare(
                                     "SELECT last_verified_offset, st_dev, st_ino
                                      FROM sync_checkpoints WHERE file_path = ?1"
                                 ).ok();
-                                match stmt.and_then(|mut s| s.query_row(
+                                stmt.and_then(|mut s| s.query_row(
                                     rusqlite::params![path_str],
                                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u64>(1)?, r.get::<_, u64>(2)?))
-                                ).ok()) {
-                                    Some(v) => v,
-                                    None => (0, 0, 0),
-                                }
+                                ).ok()).unwrap_or_default()
                             };
 
                             let signal = RotationAuditor::audit_file_change(

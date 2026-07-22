@@ -16,19 +16,19 @@ pub trait PlatformScanner: Send + Sync {
 }
 
 // 按平台导出具体实现
-#[cfg(target_os = "windows")]
-pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
-
 #[cfg(target_os = "windows")]
-pub use windows::WindowsScanner as PlatformScannerImpl;
+pub mod windows;
+
 #[cfg(target_os = "linux")]
 pub use linux::LinuxScanner as PlatformScannerImpl;
 #[cfg(target_os = "macos")]
 pub use macos::MacosScanner as PlatformScannerImpl;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsScanner as PlatformScannerImpl;
 
 /// 兜底：未知平台使用通用 walkdir
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -37,9 +37,9 @@ pub use fallback::FallbackScanner as PlatformScannerImpl;
 // ============================================================
 // 运行时跟踪器
 // ============================================================
-pub mod tracker;
 #[cfg(target_os = "linux")]
 mod linux_tracker;
+pub mod tracker;
 #[cfg(target_os = "linux")]
 pub use linux_tracker::LinuxTracker as PlatformTrackerImpl;
 #[cfg(not(target_os = "linux"))]

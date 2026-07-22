@@ -1,7 +1,7 @@
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 /// macOS/Windows 通用运行时跟踪器（基于 notify 库）
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::tracker::{FileChangeEvent, FileChangeKind, PlatformTracker};
 
@@ -16,11 +16,17 @@ impl NotifyTracker {
 impl PlatformTracker for NotifyTracker {
     fn name(&self) -> &'static str {
         #[cfg(target_os = "macos")]
-        { "macos-fsevents" }
+        {
+            "macos-fsevents"
+        }
         #[cfg(target_os = "windows")]
-        { "windows-readdirchanges" }
+        {
+            "windows-readdirchanges"
+        }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        { "notify-generic" }
+        {
+            "notify-generic"
+        }
     }
 
     fn start_watching(

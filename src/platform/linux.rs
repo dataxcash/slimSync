@@ -1,11 +1,11 @@
+use crossbeam_channel::Sender;
+use jwalk::WalkDir;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
-use jwalk::WalkDir;
-use crossbeam_channel::Sender;
 
-use crate::scanner::ScanItem;
 use super::PlatformScanner;
+use crate::scanner::ScanItem;
 
 /// Linux 平台扫描器
 /// Phase 1: jwalk 并行扫描（兜底）
@@ -44,13 +44,16 @@ impl PlatformScanner for LinuxScanner {
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
 
-                if tx.send(ScanItem {
-                    file_path: entry.path().to_string_lossy().into_owned(),
-                    mtime_ns,
-                    file_size: meta.len() as i64,
-                    st_dev: meta.dev(),
-                    st_ino: meta.ino(),
-                }).is_err() {
+                if tx
+                    .send(ScanItem {
+                        file_path: entry.path().to_string_lossy().into_owned(),
+                        mtime_ns,
+                        file_size: meta.len() as i64,
+                        st_dev: meta.dev(),
+                        st_ino: meta.ino(),
+                    })
+                    .is_err()
+                {
                     break; // receiver dropped
                 }
             }

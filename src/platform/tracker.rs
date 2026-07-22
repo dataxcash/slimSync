@@ -23,5 +23,3 @@ pub enum FileChangeKind {
     Modified,
     Removed,
 }
-
-

@@ -1,5 +1,5 @@
-use std::fs;
 use crate::slicer::Chunk;
+use std::fs;
 
 /// Tree-sitter 流式 AST 骨架提取
 /// Phase 1：按段落/空行分割；Phase 2 替换为真正的 Tree-sitter 绑定
