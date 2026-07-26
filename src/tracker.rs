@@ -1,12 +1,14 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use crate::bus::Bus;
 use crate::config::WatchConfig;
 use crate::ledger::LocalLedger;
-use crate::platform::tracker::{FileChangeKind, PlatformTracker};
+use crate::platform::tracker::{FileChangeKind, PlatformTracker, WatchOp};
 use crate::platform::PlatformTrackerImpl;
 
 #[cfg(unix)]
@@ -51,6 +53,13 @@ impl RotationAuditor {
     }
 }
 
+/// 来自 IPC 的 Watch 控制命令
+pub enum WatchCommand {
+    AddDir(PathBuf),
+    RemoveDir(PathBuf),
+    ListDirs(oneshot::Sender<Vec<String>>),
+}
+
 pub struct FileTracker {
     watch_cfg: WatchConfig,
     debounce_ms: u64,
@@ -64,7 +73,12 @@ impl FileTracker {
         }
     }
 
-    pub async fn run(self, ledger: Arc<Mutex<LocalLedger>>, bus: Arc<Bus>) {
+    pub async fn run(
+        self,
+        ledger: Arc<Mutex<LocalLedger>>,
+        bus: Arc<Bus>,
+        mut cmd_rx: mpsc::UnboundedReceiver<WatchCommand>,
+    ) {
         let (tx, mut rx) = mpsc::unbounded_channel::<crate::platform::tracker::FileChangeEvent>();
 
         // 启动平台特异性跟踪器
@@ -72,15 +86,39 @@ impl FileTracker {
         tracing::info!("runtime tracker: {}", tracker.name());
 
         let (os_tx, os_rx) = std::sync::mpsc::channel();
-        if let Err(e) = tracker.start_watching(&self.watch_cfg.dirs, os_tx) {
-            tracing::error!("failed to start tracker: {}", e);
-            return;
-        }
+        let watch_handle = tracker
+            .start_watching(&self.watch_cfg.dirs, os_tx)
+            .expect("failed to start tracker");
 
-        // 转发 OS 事件到 tokio channel
+        // 活跃目录集合（初始加载配置中的目录 + DB 中的持久化目录）
+        let active_dirs: Arc<Mutex<HashSet<PathBuf>>> = {
+            let guard = ledger.lock().unwrap();
+            let mut dirs: HashSet<PathBuf> = self.watch_cfg.dirs.iter().cloned().collect();
+            if let Ok(mut stmt) = guard.conn.prepare("SELECT path FROM watched_dirs") {
+                if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                    for row in rows.flatten() {
+                        let p = PathBuf::from(row);
+                        dirs.insert(p);
+                    }
+                }
+            }
+            Arc::new(Mutex::new(dirs))
+        };
+
+        // 转发 OS 事件到 tokio channel，同时过滤不在活跃集合中的路径
+        let active = active_dirs.clone();
         tokio::spawn(async move {
             while let Ok(event) = os_rx.recv() {
-                let _ = tx.send(event);
+                let is_active = {
+                    let dirs = active.lock().unwrap();
+                    dirs.iter().any(|d| {
+                        event.file_path.starts_with(d.to_str().unwrap_or(""))
+                            || d.to_str().map_or(false, |ds| event.file_path == ds)
+                    })
+                };
+                if is_active {
+                    let _ = tx.send(event);
+                }
             }
         });
 
@@ -93,7 +131,6 @@ impl FileTracker {
                         FileChangeKind::Created | FileChangeKind::Modified => {
                             let path_str = event.file_path;
                             if path_str.is_empty() {
-                                // fanotify 需要路径解析，TODO Phase 2
                                 continue;
                             }
                             if self.watch_cfg.is_excluded(&path_str) {
@@ -163,6 +200,50 @@ impl FileTracker {
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        WatchCommand::AddDir(path) => {
+                            active_dirs.lock().unwrap().insert(path.clone());
+                            // 同步到 OS 跟踪器
+                            if let Some(ref ctl) = watch_handle.control_tx {
+                                let _ = ctl.send(WatchOp::Add(path.clone()));
+                            }
+                            // 持久化到账本
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            if let Ok(guard) = ledger.lock() {
+                                let _ = guard.conn.execute(
+                                    "INSERT INTO watched_dirs (path, added_at) VALUES (?1, ?2)
+                                     ON CONFLICT(path) DO UPDATE SET added_at = ?2",
+                                    rusqlite::params![path.to_string_lossy().to_string(), now],
+                                );
+                            }
+                            tracing::info!("watch added: {}", path.display());
+                        }
+                        WatchCommand::RemoveDir(path) => {
+                            active_dirs.lock().unwrap().remove(&path);
+                            if let Some(ref ctl) = watch_handle.control_tx {
+                                let _ = ctl.send(WatchOp::Remove(path.clone()));
+                            }
+                            if let Ok(guard) = ledger.lock() {
+                                let _ = guard.conn.execute(
+                                    "DELETE FROM watched_dirs WHERE path = ?1",
+                                    rusqlite::params![path.to_string_lossy().to_string()],
+                                );
+                            }
+                            tracing::info!("watch removed: {}", path.display());
+                        }
+                        WatchCommand::ListDirs(reply) => {
+                            let dirs = active_dirs.lock().unwrap();
+                            let list: Vec<String> = dirs.iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+                            let _ = reply.send(list);
                         }
                     }
                 }

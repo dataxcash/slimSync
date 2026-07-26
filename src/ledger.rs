@@ -86,6 +86,16 @@ impl LocalLedger {
             [],
         )?;
 
+        tx.execute(
+            "
+            CREATE TABLE IF NOT EXISTS watched_dirs (
+                path TEXT PRIMARY KEY,
+                added_at INTEGER NOT NULL
+            );
+        ",
+            [],
+        )?;
+
         tx.commit()
     }
 
