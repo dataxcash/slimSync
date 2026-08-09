@@ -231,7 +231,7 @@ impl FileTracker {
                         RotationSignal::ResetAndRechunk => 0,
                     };
 
-                    if let Ok(new_offset) = bus.process_file(&ledger, &path_str, start).await {
+                    if let Ok(new_offset) = bus.process_file(&path_str, start).await {
                         if let Ok(guard) = ledger.lock() {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -339,7 +339,7 @@ async fn handle_segment_event(
         return; // 无新增字节（如刚 create 的空段）
     }
     tracing::info!("segment event: {} seq={} tail from {}", path_str, seq, start_offset);
-    let last_offset = match bus.process_file(ledger, path_str, start_offset).await {
+    let last_offset = match bus.process_file(path_str, start_offset).await {
         Ok(o) => o,
         Err(e) => {
             tracing::error!("segment event: failed to process {}: {}", path_str, e);
@@ -390,7 +390,7 @@ async fn seal_lower_segments(
             .map(|s| s.synced_offset.max(0) as u64)
             .unwrap_or(0);
         let last_offset = if synced < size {
-            match bus.process_file(ledger, &file_path, synced).await {
+            match bus.process_file(&file_path, synced).await {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::error!("seal: failed to process {}: {}", file_path, e);

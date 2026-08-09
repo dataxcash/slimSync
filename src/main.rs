@@ -308,7 +308,7 @@ async fn run_cold_start(
         }
         let seq = crate::segment::parse_segment_seq(file_path).unwrap_or(0);
         tracing::info!("cold start processing segment: {}", file_path);
-        match bus.process_file(ledger, file_path, start_offset).await {
+        match bus.process_file(file_path, start_offset).await {
             Ok(last_offset) => {
                 if let Ok(meta) = std::fs::metadata(file_path) {
                     let size = meta.len();
@@ -335,7 +335,7 @@ async fn run_cold_start(
     for file_path in &delta_files {
         if Path::new(file_path).exists() {
             tracing::info!("cold start processing: {}", file_path);
-            if let Err(e) = bus.process_file(ledger, file_path, 0).await {
+            if let Err(e) = bus.process_file(file_path, 0).await {
                 tracing::error!("cold start: failed to process {}: {}", file_path, e);
             }
         }

@@ -115,25 +115,11 @@ impl LocalLedger {
             [],
         )?;
 
-        tx.commit()
-    }
+        tx.commit()?;
 
-    /// 检查本地 sent_hashes 中某 Blind-ID 是否被远端确认
-    pub fn check_sent_hashes_confirmed(&self, blind_id: &[u8; 16]) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sent_hashes WHERE blind_id = ?1 AND confirmed = 1",
-            params![blind_id],
-            |r| r.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    /// 更新 sent_hashes 中某 Blind-ID 的确认状态
-    pub fn update_sent_hash_status(&self, blind_id: &[u8; 16], confirmed: i32) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sent_hashes SET confirmed = ?1 WHERE blind_id = ?2",
-            params![confirmed, blind_id],
-        )?;
+        // 方案 A（弃用 REF_ONLY）：去重引用帧的盲缓存逐出竞态会造成系统性丢段，
+        // 发送端已不再查询/写入 sent_hashes。清理历史遗留数据，避免无界磁盘/页缓存增长。
+        self.conn.execute("DELETE FROM sent_hashes;", [])?;
         Ok(())
     }
 

@@ -1,9 +1,7 @@
-use std::sync::Mutex;
 use zenoh::Session;
 
 use crate::config::ZenohConfig;
 use crate::crypto;
-use crate::ledger::LocalLedger;
 use crate::slicer;
 use crate::segment;
 
@@ -54,83 +52,41 @@ impl Bus {
         self.session.is_some()
     }
 
-    /// 盲去重查询：本地 sent_hashes → 远端 Query → 回写缓存
-    pub async fn is_chunk_known(&self, ledger: &Mutex<LocalLedger>, blind_id: &[u8; 16]) -> bool {
-        if let Ok(guard) = ledger.lock() {
-            if let Ok(true) = guard.check_sent_hashes_confirmed(blind_id) {
-                return true;
-            }
-        }
-        if let Some(session) = &self.session {
-            let topic = format!("{}/{}", slim_common::topics::EXISTS, hex::encode(blind_id));
-            // 无 reply 时快速判定（远端可能不响应 EXISTS query），避免 10s 默认超时阻塞处理管线
-            let get = session.get(topic).timeout(std::time::Duration::from_millis(300));
-            if let Ok(replies) = get.await {
-                for reply in replies {
-                    if let Ok(sample) = reply.result() {
-                        let text = sample.payload().to_bytes();
-                        if text.as_ref() == b"true" {
-                            if let Ok(guard) = ledger.lock() {
-                                let _ = guard.update_sent_hash_status(blind_id, 1);
-                            }
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// 发送一个 Chunk（缺陷 #7 修正：负载头部携带 segment_seq + start_offset）。
+    /// 发送一个 Chunk（方案 A 修正：弃用 REF_ONLY 去重引用帧）。
     ///
-    /// - 未去重：发布全量帧 = [ChunkFrame header] + [nonce12 + ChaCha20 密文]
-    /// - 已去重：发布 REF_ONLY 引用帧（仅元数据，接收端用 blind_id 物化字节），
-    ///   保证接收端重组不因去重跳发而缺洞。
+    /// ## 缺陷（现象→根因→影响→方案）
+    /// - 现象：活跃负载下每个封盘段都缺尾部 4~66MB，`gaps` 随数据量累积，接收端 RSS
+    ///   因 pending 无界滞留涨到 448MB+。
+    /// - 根因：旧实现把"本地已确认"的 chunk 发成 REF_ONLY 引用帧（不再询问接收端）；
+    ///   接收端盲缓存是 64MB FIFO、高流量下持续逐出 → 被逐出 blind 的引用帧无法物化
+    ///   → 续接 chunk 缺位 → 该段后续所有帧永久滞留 pending。插桩实测 recv_frames≈
+    ///   发送帧数（网络零丢失），缺口恰为一个 cache_miss 的续接 chunk。
+    /// - 影响：TC-1「丢失 0」不成立；接收端内存无界增长。
+    /// - 方案：一律发送全量加密数据帧。当前 1Gbps 链路带宽远非瓶颈，去重收益 < 正确性
+    ///   代价；`known=false` 帧接收端照常落位，帧契约格式不变（接收端仍兼容引用帧）。
     pub async fn send_chunk(
         &self,
-        ledger: &Mutex<LocalLedger>,
-        file_path: &str,
         data: &[u8],
         offset: u64,
         segment_seq: u32,
     ) -> Result<[u8; 16], Box<dyn std::error::Error>> {
         let blind_id = crypto::generate_blind_id(data, &self.salt);
-        let known = self.is_chunk_known(ledger, &blind_id).await;
-        let cipher = if known {
-            tracing::debug!("chunk dedup skip: {}", hex::encode(blind_id));
-            Vec::new()
-        } else {
-            crypto::encrypt_chunk(&self.key, data)
-        };
+        let cipher = crypto::encrypt_chunk(&self.key, data);
         tracing::debug!(
-            "send_chunk: blind={} seg={} off={} plain={}B cipher={}B ref={}",
+            "send_chunk: blind={} seg={} off={} plain={}B cipher={}B",
             hex::encode(blind_id),
             segment_seq,
             offset,
             data.len(),
-            cipher.len(),
-            known
+            cipher.len()
         );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        if let Ok(guard) = ledger.lock() {
-            guard.conn.execute(
-                "INSERT INTO sent_hashes (blind_id, file_path, sent_at, confirmed)
-                 VALUES (?1, ?2, ?3, 0)
-                 ON CONFLICT(blind_id) DO NOTHING",
-                rusqlite::params![blind_id, file_path, now],
-            )?;
-        }
         let frame = slim_common::framing::encode_chunk_frame(
             self.dev_id,
             segment_seq,
             offset,
             data.len() as u32,
             &cipher,
-            known,
+            false,
         );
         if let Some(session) = &self.session {
             let topic = format!(
@@ -171,7 +127,6 @@ impl Bus {
     /// 改为 `slice_file_iter` 有界窗口流式迭代，任何时刻只保留单个待发 chunk + 64KB 窗口。
     pub async fn process_file(
         &self,
-        ledger: &Mutex<LocalLedger>,
         file_path: &str,
         start_offset: u64,
     ) -> Result<u64, Box<dyn std::error::Error>> {
@@ -183,7 +138,7 @@ impl Bus {
         let mut chunk_count: u64 = 0;
         for chunk in slicer::slice_file_iter(path, start_offset) {
             let _blind_id = self
-                .send_chunk(ledger, file_path, &chunk.data, chunk.offset, segment_seq)
+                .send_chunk(&chunk.data, chunk.offset, segment_seq)
                 .await?;
             last_offset = chunk.offset + chunk.length;
             chunk_count += 1;
