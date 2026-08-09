@@ -42,10 +42,16 @@ impl PlatformTracker for LinuxTracker {
         sender: Sender<FileChangeEvent>,
     ) -> Result<WatchHandle, Box<dyn std::error::Error>> {
         if self.use_fanotify {
-            start_fanotify(dirs, sender)
-        } else {
-            start_inotify(dirs, sender)
+            match start_fanotify(dirs, sender.clone()) {
+                Ok(h) => return Ok(h),
+                Err(e) => {
+                    tracing::warn!(
+                        "fanotify mark 失败（{e}），降级到 inotify（probe 只测 init 未测 mark）"
+                    );
+                }
+            }
         }
+        start_inotify(dirs, sender)
     }
 }
 

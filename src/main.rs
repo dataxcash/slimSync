@@ -4,6 +4,7 @@ mod crypto;
 mod ledger;
 mod platform;
 mod scanner;
+mod segment;
 mod slicer;
 mod tracker;
 
@@ -100,8 +101,15 @@ fn main() {
 
 // ─── 前台模式（原始行为） ─────────────────────────────────────────
 
+/// 默认 info 级日志（兼容 RUST_LOG 覆盖），避免未设环境变量时日志静默。
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 async fn run_foreground(config_path: Option<String>) {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cfg = config::load(config_path).expect("failed to load config");
     let ledger = Arc::new(std::sync::Mutex::new(
         ledger::LocalLedger::open(&cfg.storage.db_path).expect("failed to open ledger"),
@@ -119,7 +127,7 @@ async fn run_foreground(config_path: Option<String>) {
         b"default-group-salt!".to_vec()
     });
 
-    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, salt).await);
+    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, salt, cfg.dev_id).await);
     tracing::info!(
         "zenoh bus: {}",
         if bus.is_online() {
@@ -129,49 +137,7 @@ async fn run_foreground(config_path: Option<String>) {
         }
     );
 
-    tracing::info!(
-        "cold start: scanning with {}",
-        platform::PlatformScannerImpl.name()
-    );
-    {
-        let mut guard = ledger.lock().unwrap();
-        guard.init_temp_scan().expect("failed to init temp_scan");
-    }
-    {
-        let scanner: Arc<dyn PlatformScanner> = Arc::new(platform::PlatformScannerImpl);
-        let mut guard = ledger.lock().unwrap();
-        scanner::batch_scan(scanner, &cfg.watch.dirs, &mut guard).expect("failed to batch scan");
-    }
-    let delta = {
-        let mut guard = ledger.lock().unwrap();
-        guard
-            .compute_delta_manifests()
-            .expect("failed to compute delta manifests")
-    };
-    tracing::info!(
-        "cold start: platform={}, new={}, modified={}, deleted={}",
-        platform::PlatformScannerImpl.name(),
-        delta.0.len(),
-        delta.1.len(),
-        delta.2.len(),
-    );
-
-    for file_path in delta.0.iter().chain(delta.1.iter()) {
-        if Path::new(file_path).exists() {
-            tracing::info!("cold start processing: {}", file_path);
-            if let Err(e) = bus.process_file(&ledger, file_path, 0).await {
-                tracing::error!("cold start: failed to process {}: {}", file_path, e);
-            }
-        }
-    }
-    for file_path in &delta.2 {
-        if let Ok(guard) = ledger.lock() {
-            let _ = guard.conn.execute(
-                "DELETE FROM sync_checkpoints WHERE file_path = ?1",
-                rusqlite::params![file_path],
-            );
-        }
-    }
+    run_cold_start(&ledger, &bus, &cfg.watch.dirs).await;
 
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let tracker = tracker::FileTracker::new(cfg.watch.clone(), cfg.watch.debounce_ms);
@@ -187,7 +153,7 @@ async fn run_foreground(config_path: Option<String>) {
 // ─── 守护进程模式 ────────────────────────────────────────────────
 
 async fn run_daemon(config_path: Option<String>) {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let _ = tokio::fs::remove_file(SOCKET_PATH).await;
 
     let listener = UnixListener::bind(SOCKET_PATH).expect("failed to bind Unix socket");
@@ -210,7 +176,7 @@ async fn run_daemon(config_path: Option<String>) {
         b"default-group-salt!".to_vec()
     });
 
-    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, salt).await);
+    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, salt, cfg.dev_id).await);
     tracing::info!(
         "zenoh bus: {}",
         if bus.is_online() {
@@ -220,49 +186,7 @@ async fn run_daemon(config_path: Option<String>) {
         }
     );
 
-    tracing::info!(
-        "cold start: scanning with {}",
-        platform::PlatformScannerImpl.name()
-    );
-    {
-        let mut guard = ledger.lock().unwrap();
-        guard.init_temp_scan().expect("failed to init temp_scan");
-    }
-    {
-        let scanner: Arc<dyn PlatformScanner> = Arc::new(platform::PlatformScannerImpl);
-        let mut guard = ledger.lock().unwrap();
-        scanner::batch_scan(scanner, &cfg.watch.dirs, &mut guard).expect("failed to batch scan");
-    }
-    let delta = {
-        let mut guard = ledger.lock().unwrap();
-        guard
-            .compute_delta_manifests()
-            .expect("failed to compute delta manifests")
-    };
-    tracing::info!(
-        "cold start: platform={}, new={}, modified={}, deleted={}",
-        platform::PlatformScannerImpl.name(),
-        delta.0.len(),
-        delta.1.len(),
-        delta.2.len(),
-    );
-
-    for file_path in delta.0.iter().chain(delta.1.iter()) {
-        if Path::new(file_path).exists() {
-            tracing::info!("cold start processing: {}", file_path);
-            if let Err(e) = bus.process_file(&ledger, file_path, 0).await {
-                tracing::error!("cold start: failed to process {}: {}", file_path, e);
-            }
-        }
-    }
-    for file_path in &delta.2 {
-        if let Ok(guard) = ledger.lock() {
-            let _ = guard.conn.execute(
-                "DELETE FROM sync_checkpoints WHERE file_path = ?1",
-                rusqlite::params![file_path],
-            );
-        }
-    }
+    run_cold_start(&ledger, &bus, &cfg.watch.dirs).await;
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WatchCommand>();
 
@@ -284,6 +208,146 @@ async fn run_daemon(config_path: Option<String>) {
     ipc_handle.abort();
     let _ = tokio::fs::remove_file(SOCKET_PATH).await;
     let _ = std::fs::remove_file(PID_FILE);
+}
+
+// ─── 冷启动：段状态机（缺陷 #6） + 非段文件增量差分 ────────────────────────────
+
+/// 冷启动统一入口：
+/// 1. 对 segment_*.wal 走显式段状态机（Unfinished 只追 tail / Sealed 全量 HASH 校验），
+///    彻底规避 mtime/size 临界区误判导致的段遗漏（segment_0000/0001）。
+/// 2. 对普通文件保留原 mtime/size 差分逻辑。
+async fn run_cold_start(
+    ledger: &Arc<std::sync::Mutex<ledger::LocalLedger>>,
+    bus: &Arc<bus::Bus>,
+    dirs: &[PathBuf],
+) {
+    tracing::info!(
+        "cold start: scanning with {}",
+        platform::PlatformScannerImpl.name()
+    );
+    {
+        let mut guard = ledger.lock().unwrap();
+        guard.init_temp_scan().expect("failed to init temp_scan");
+    }
+    {
+        let scanner: Arc<dyn PlatformScanner> = Arc::new(platform::PlatformScannerImpl);
+        let mut guard = ledger.lock().unwrap();
+        scanner::batch_scan(scanner, dirs, &mut guard).expect("failed to batch scan");
+    }
+
+    let scan_items = {
+        let guard = ledger.lock().unwrap();
+        guard
+            .load_temp_scan()
+            .expect("failed to load temp_scan")
+    };
+
+    // ① 段状态机规划（Segmented WAL）
+    let segment_plans = {
+        let mut guard = ledger.lock().unwrap();
+        crate::segment::plan_segments(&scan_items, &mut guard)
+            .expect("failed to plan segments")
+    };
+
+    // ② 非段文件差分（过滤掉已由状态机管辖的段文件）
+    let delta = {
+        let mut guard = ledger.lock().unwrap();
+        guard
+            .compute_delta_manifests()
+            .expect("failed to compute delta manifests")
+    };
+    let delta_files: Vec<String> = delta
+        .0
+        .into_iter()
+        .chain(delta.1.into_iter())
+        .filter(|p| !crate::segment::is_segment_file(p))
+        .collect();
+    tracing::info!(
+        "cold start: platform={}, new+modified(非段)={}, deleted={}, segment_plans={}",
+        platform::PlatformScannerImpl.name(),
+        delta_files.len(),
+        delta.2.len(),
+        segment_plans.len()
+    );
+
+    // ③ 清理已淘汰（Unlink-Oldest）段的本地状态记录
+    {
+        let guard = ledger.lock().unwrap();
+        for item in &scan_items {
+            let _ = crate::segment::parse_segment_seq(&item.file_path);
+        }
+        let present: std::collections::HashSet<u32> = scan_items
+            .iter()
+            .filter_map(|it| crate::segment::parse_segment_seq(&it.file_path))
+            .collect();
+        if let Some(max_seq) = guard.max_segment_seq().ok().flatten() {
+            for seq in 0..=max_seq {
+                if !present.contains(&seq) {
+                    let _ = guard.delete_segment(seq);
+                }
+            }
+        }
+    }
+
+    // ④ 执行段状态机计划（升序，确保段封盘信号按序发布）
+    let present_max = scan_items
+        .iter()
+        .filter_map(|it| crate::segment::parse_segment_seq(&it.file_path))
+        .max();
+    for plan in &segment_plans {
+        let (file_path, start_offset) = match plan {
+            crate::segment::SegmentPlan::FullSync { file_path } => (file_path, 0u64),
+            crate::segment::SegmentPlan::TailSync {
+                file_path,
+                start_offset,
+            } => (file_path, *start_offset),
+            crate::segment::SegmentPlan::Skip => continue,
+        };
+        if !Path::new(file_path).exists() {
+            continue;
+        }
+        let seq = crate::segment::parse_segment_seq(file_path).unwrap_or(0);
+        tracing::info!("cold start processing segment: {}", file_path);
+        match bus.process_file(ledger, file_path, start_offset).await {
+            Ok(last_offset) => {
+                if let Ok(meta) = std::fs::metadata(file_path) {
+                    let size = meta.len();
+                    if Some(seq) == present_max {
+                        // 活跃段：只记录已同步偏移
+                        if let Ok(guard) = ledger.lock() {
+                            let _ = guard.upsert_segment(seq, file_path, "UNFINISHED", last_offset);
+                        }
+                    } else {
+                        // 封盘段：记录全量 HASH，并向接收端发布封盘信号
+                        let hash = crate::segment::sha256_file(Path::new(file_path)).unwrap_or([0u8; 32]);
+                        if let Ok(guard) = ledger.lock() {
+                            let _ = guard.seal_segment(seq, file_path, size, &hash, last_offset);
+                        }
+                        bus.send_seal(seq, size).await;
+                    }
+                }
+            }
+            Err(e) => tracing::error!("cold start: failed to process {}: {}", file_path, e),
+        }
+    }
+
+    // ⑤ 非段文件增量处理 + 删除清理
+    for file_path in &delta_files {
+        if Path::new(file_path).exists() {
+            tracing::info!("cold start processing: {}", file_path);
+            if let Err(e) = bus.process_file(ledger, file_path, 0).await {
+                tracing::error!("cold start: failed to process {}: {}", file_path, e);
+            }
+        }
+    }
+    for file_path in &delta.2 {
+        if let Ok(guard) = ledger.lock() {
+            let _ = guard.conn.execute(
+                "DELETE FROM sync_checkpoints WHERE file_path = ?1",
+                rusqlite::params![file_path],
+            );
+        }
+    }
 }
 
 // ─── IPC 服务端 ──────────────────────────────────────────────────

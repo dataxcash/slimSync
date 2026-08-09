@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::path::Path;
 
 use crate::scanner::ScanItem;
@@ -91,6 +91,25 @@ impl LocalLedger {
             CREATE TABLE IF NOT EXISTS watched_dirs (
                 path TEXT PRIMARY KEY,
                 added_at INTEGER NOT NULL
+            );
+        ",
+            [],
+        )?;
+
+        // 段状态机（缺陷 #6 修正）：Unfinished -> Sealed 显式状态。
+        // 冷启动扫描时：对正在写入（Unfinished）的段只追 tail；
+        // 对已 Sealed 的段比对全量 HASH/Size，避免因 mtime/size 临界区误判而跳过
+        // segment_0000/0001（探针写入中 mtime 未及时刷新 / 历史段标记过严）。
+        tx.execute(
+            "
+            CREATE TABLE IF NOT EXISTS segments (
+                segment_seq INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'UNFINISHED',
+                sealed_size INTEGER NOT NULL DEFAULT 0,
+                sealed_hash BLOB,
+                synced_offset INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
             );
         ",
             [],
@@ -212,4 +231,127 @@ impl LocalLedger {
 
         Ok((new_files, modified_files, deleted_files))
     }
+
+    /// 读取 temp_scan 全部条目（供段状态机冷启动规划读取）。
+    pub fn load_temp_scan(&self) -> Result<Vec<ScanItem>> {
+        let mut items = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, mtime_ns, file_size, st_dev, st_ino FROM temp_scan",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ScanItem {
+                file_path: r.get(0)?,
+                mtime_ns: r.get(1)?,
+                file_size: r.get(2)?,
+                st_dev: r.get(3)?,
+                st_ino: r.get(4)?,
+            })
+        })?;
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// 查询某 segment 文件的状态机记录。
+    pub fn get_segment(&self, segment_seq: u32) -> Result<Option<SegmentState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT segment_seq, file_path, state, sealed_size, sealed_hash, synced_offset
+             FROM segments WHERE segment_seq = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![segment_seq], |r| {
+            Ok(SegmentState {
+                segment_seq: r.get(0)?,
+                file_path: r.get(1)?,
+                state: r.get(2)?,
+                sealed_size: r.get(3)?,
+                sealed_hash: r.get(4)?,
+                synced_offset: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    /// 查询当前最大已知段号（用于判断新段是否触发前段封盘）。
+    pub fn max_segment_seq(&self) -> Result<Option<u32>> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(segment_seq) FROM segments", [], |r| r.get(0))
+            .optional()?;
+        Ok(seq.map(|s| s as u32))
+    }
+
+    /// 写入/更新段状态（UNFINISHED 推进 synced_offset）。
+    pub fn upsert_segment(
+        &self,
+        segment_seq: u32,
+        file_path: &str,
+        state: &str,
+        synced_offset: u64,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        self.conn.execute(
+            "INSERT INTO segments (segment_seq, file_path, state, sealed_size, sealed_hash, synced_offset, updated_at)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4, ?5)
+             ON CONFLICT(segment_seq) DO UPDATE SET
+               file_path=?2, state=?3, synced_offset=?4, updated_at=?5",
+            params![segment_seq, file_path, state, synced_offset as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// 封盘：写入段终态（完整尺寸 + 全量内容 Hash + 已同步偏移）。
+    pub fn seal_segment(
+        &self,
+        segment_seq: u32,
+        file_path: &str,
+        sealed_size: u64,
+        sealed_hash: &[u8],
+        synced_offset: u64,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        self.conn.execute(
+            "INSERT INTO segments (segment_seq, file_path, state, sealed_size, sealed_hash, synced_offset, updated_at)
+             VALUES (?1, ?2, 'SEALED', ?3, ?4, ?5, ?6)
+             ON CONFLICT(segment_seq) DO UPDATE SET
+               file_path=?2, state='SEALED', sealed_size=?3, sealed_hash=?4,
+               synced_offset=?5, updated_at=?6",
+            params![
+                segment_seq,
+                file_path,
+                sealed_size as i64,
+                sealed_hash,
+                synced_offset as i64,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 删除某段状态记录（文件被 Unlink-Oldest 淘汰时调用）。
+    pub fn delete_segment(&self, segment_seq: u32) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM segments WHERE segment_seq = ?1",
+            params![segment_seq],
+        )?;
+        Ok(())
+    }
+}
+
+/// 段状态机记录行。
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // sealed_size 等字段为持久化状态机契约的一部分
+pub struct SegmentState {
+    pub segment_seq: u32,
+    pub file_path: String,
+    pub state: String,
+    pub sealed_size: i64,
+    pub sealed_hash: Option<Vec<u8>>,
+    pub synced_offset: i64,
 }
