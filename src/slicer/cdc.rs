@@ -1,5 +1,6 @@
 use crate::slicer::Chunk;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 // FastCDC 参数
@@ -12,18 +13,25 @@ fn gear_hash(b: u8) -> u64 {
     (b as u64).wrapping_mul(0x9e3779b97f4a7c15)
 }
 
-/// FastCDC 滚动哈希切片
+/// FastCDC 滚动哈希切片（缺陷修复：追 tail 时只读增量，绝不整文件重读）。
+///
+/// 热路径优化：旧实现每次 `fs::read` 读整个文件再切 `[start_offset..]`，
+/// 高吞吐下（探针 64MB 段/2.7s 轮转）每次事件都 O(文件全量)，追不上写入速率。
+/// 改为 seek 到 `start_offset` 只读剩余尾部，单次处理成本 O(tail)。
 pub fn fastcdc_chunk(file_path: &Path, start_offset: u64) -> Vec<Chunk> {
-    let content = match fs::read(file_path) {
-        Ok(c) => c,
+    let mut f = match fs::File::open(file_path) {
+        Ok(f) => f,
         Err(_) => return vec![],
     };
-
-    if start_offset >= content.len() as u64 {
+    if start_offset > 0 && f.seek(SeekFrom::Start(start_offset)).is_err() {
+        return vec![];
+    }
+    let mut content = Vec::new();
+    if f.read_to_end(&mut content).is_err() || content.is_empty() {
         return vec![];
     }
 
-    let data = &content[start_offset as usize..];
+    let data = &content[..];
     let mut chunks = Vec::new();
     let mut pos = 0usize;
     let mut hash = 0u64;

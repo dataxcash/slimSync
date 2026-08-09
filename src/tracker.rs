@@ -140,101 +140,115 @@ impl FileTracker {
         let debounce = Duration::from_millis(self.debounce_ms);
         tracing::info!("tracker.run: entering main loop (debounce={:?})", debounce);
 
+        // 冷却吸收表：debounce 窗口内同路径 Modified 事件合并为一次处理，
+        // 防止探针高吞吐写入时 inotify 事件洪泛把主循环拖死（新段 Created 被饿死 → 无法封盘）。
+        let mut last_seen_at: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+
         loop {
-            // 诊断：try_recv 检查队列是否真的有事件
-            match rx.try_recv() {
-                Ok(ev) => tracing::info!("try_recv got: {:?} {}", ev.event_kind, ev.file_path),
-                Err(_) => {}
-            }
             tokio::select! {
                 Some(event) = rx.recv() => {
-                    tracing::info!("tracker select: got event kind={:?}", event.event_kind);
-                    match event.event_kind {
-                        FileChangeKind::Created | FileChangeKind::Modified => {
-                            let path_str = event.file_path;
-                            if path_str.is_empty() {
-                                continue;
+                    let path_str = event.file_path;
+                    let is_created = event.event_kind == FileChangeKind::Created;
+                    if path_str.is_empty() {
+                        continue;
+                    }
+                    if self.watch_cfg.is_excluded(&path_str) {
+                        continue;
+                    }
+                    // 冷却吸收：Created 始终处理（新段封盘依赖）；Modified 在 debounce 窗口内合并。
+                    // 占位须在处理前写入，使 debounce 睡眠期间到达的同路径事件被吸收（防串行化洪泛）。
+                    if !is_created {
+                        let now = std::time::Instant::now();
+                        let recently = last_seen_at
+                            .get(&path_str)
+                            .map_or(false, |t| now.duration_since(*t) < debounce);
+                        if recently {
+                            continue;
+                        }
+                        last_seen_at.insert(path_str.clone(), now);
+                    }
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as i64;
+                    if let Ok(guard) = ledger.lock() {
+                        let _ = guard.conn.execute(
+                            "INSERT INTO dirty_files (file_path, first_dirty_at, last_dirty_at)
+                             VALUES (?1, ?2, ?3)
+                             ON CONFLICT(file_path) DO UPDATE SET last_dirty_at = ?3",
+                            rusqlite::params![path_str, now, now],
+                        );
+                    }
+                    tokio::time::sleep(debounce).await;
+                    // 处理完成：刷新冷却时间戳
+                    last_seen_at.insert(
+                        path_str.clone(),
+                        std::time::Instant::now(),
+                    );
+
+                    // 段状态机路径（缺陷 #6/#7）：段文件走 segments 表 + 封盘信号
+                    if let Some(seq) = segment::parse_segment_seq(&path_str) {
+                        if event.event_kind == FileChangeKind::Removed {
+                            if let Ok(guard) = ledger.lock() {
+                                let _ = guard.delete_segment(seq);
                             }
-                            if self.watch_cfg.is_excluded(&path_str) {
-                                continue;
-                            }
+                        } else {
+                            handle_segment_event(&ledger, &bus, &path_str, seq, is_created)
+                                .await;
+                        }
+                        continue;
+                    }
+
+                    if event.event_kind == FileChangeKind::Removed {
+                        if let Ok(guard) = ledger.lock() {
+                            let _ = guard.conn.execute(
+                                "DELETE FROM sync_checkpoints WHERE file_path = ?1",
+                                rusqlite::params![path_str],
+                            );
+                        }
+                        continue;
+                    }
+
+                    let (last_offset, st_dev, st_ino) = {
+                        let guard = ledger.lock().unwrap();
+                        let stmt = guard.conn.prepare(
+                            "SELECT last_verified_offset, st_dev, st_ino
+                             FROM sync_checkpoints WHERE file_path = ?1"
+                        ).ok();
+                        stmt.and_then(|mut s| s.query_row(
+                            rusqlite::params![path_str],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u64>(1)?, r.get::<_, u64>(2)?))
+                        ).ok()).unwrap_or_default()
+                    };
+
+                    let signal = RotationAuditor::audit_file_change(
+                        &path_str, last_offset, st_dev, st_ino
+                    );
+                    let start = match signal {
+                        RotationSignal::Append(o) => o,
+                        RotationSignal::ResetAndRechunk => 0,
+                    };
+
+                    if let Ok(new_offset) = bus.process_file(&ledger, &path_str, start).await {
+                        if let Ok(guard) = ledger.lock() {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() as i64;
-                            if let Ok(guard) = ledger.lock() {
-                                let _ = guard.conn.execute(
-                                    "INSERT INTO dirty_files (file_path, first_dirty_at, last_dirty_at)
-                                     VALUES (?1, ?2, ?3)
-                                     ON CONFLICT(file_path) DO UPDATE SET last_dirty_at = ?3",
-                                    rusqlite::params![path_str, now, now],
-                                );
-                            }
-                            tokio::time::sleep(debounce).await;
-
-                            // 段状态机路径（缺陷 #6/#7）：段文件走 segments 表 + 封盘信号
-                            if let Some(seq) = segment::parse_segment_seq(&path_str) {
-                                let is_created = event.event_kind == FileChangeKind::Created;
-                                handle_segment_event(&ledger, &bus, &path_str, seq, is_created)
-                                    .await;
-                                continue;
-                            }
-
-                            let (last_offset, st_dev, st_ino) = {
-                                let guard = ledger.lock().unwrap();
-                                let stmt = guard.conn.prepare(
-                                    "SELECT last_verified_offset, st_dev, st_ino
-                                     FROM sync_checkpoints WHERE file_path = ?1"
-                                ).ok();
-                                stmt.and_then(|mut s| s.query_row(
-                                    rusqlite::params![path_str],
-                                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u64>(1)?, r.get::<_, u64>(2)?))
-                                ).ok()).unwrap_or_default()
-                            };
-
-                            let signal = RotationAuditor::audit_file_change(
-                                &path_str, last_offset, st_dev, st_ino
+                            let _ = guard.conn.execute(
+                                "INSERT INTO sync_checkpoints
+                                 (file_path, file_id_prefix, last_mtime_ns, last_verified_offset, status)
+                                 VALUES (?1, X'00', ?2, ?3, 'IN_SYNC')
+                                 ON CONFLICT(file_path) DO UPDATE SET
+                                 last_mtime_ns=?2, last_verified_offset=?3, status='IN_SYNC'",
+                                rusqlite::params![path_str, now, new_offset as i64],
                             );
-                            let start = match signal {
-                                RotationSignal::Append(o) => o,
-                                RotationSignal::ResetAndRechunk => 0,
-                            };
-
-                            if let Ok(new_offset) = bus.process_file(&ledger, &path_str, start).await {
-                                if let Ok(guard) = ledger.lock() {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_nanos() as i64;
-                                    let _ = guard.conn.execute(
-                                        "INSERT INTO sync_checkpoints
-                                         (file_path, file_id_prefix, last_mtime_ns, last_verified_offset, status)
-                                         VALUES (?1, X'00', ?2, ?3, 'IN_SYNC')
-                                         ON CONFLICT(file_path) DO UPDATE SET
-                                         last_mtime_ns=?2, last_verified_offset=?3, status='IN_SYNC'",
-                                        rusqlite::params![path_str, now, new_offset as i64],
-                                    );
-                                    let _ = guard.conn.execute(
-                                        "DELETE FROM dirty_files WHERE file_path = ?1",
-                                        rusqlite::params![path_str],
-                                    );
-                                }
-                            }
-                        }
-                        FileChangeKind::Removed => {
-                            if !event.file_path.is_empty() {
-                                if let Some(seq) = segment::parse_segment_seq(&event.file_path) {
-                                    if let Ok(guard) = ledger.lock() {
-                                        let _ = guard.delete_segment(seq);
-                                    }
-                                }
-                                if let Ok(guard) = ledger.lock() {
-                                    let _ = guard.conn.execute(
-                                        "DELETE FROM sync_checkpoints WHERE file_path = ?1",
-                                        rusqlite::params![event.file_path],
-                                    );
-                                }
-                            }
+                            let _ = guard.conn.execute(
+                                "DELETE FROM dirty_files WHERE file_path = ?1",
+                                rusqlite::params![path_str],
+                            );
                         }
                     }
                 }

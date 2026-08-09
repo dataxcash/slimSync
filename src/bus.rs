@@ -103,7 +103,7 @@ impl Bus {
         } else {
             crypto::encrypt_chunk(&self.key, data)
         };
-        tracing::info!(
+        tracing::debug!(
             "send_chunk: blind={} seg={} off={} plain={}B cipher={}B ref={}",
             hex::encode(blind_id),
             segment_seq,
@@ -139,7 +139,7 @@ impl Bus {
                 hex::encode(blind_id)
             );
             match session.put(&topic, frame).await {
-                Ok(_) => tracing::info!("zenoh put OK: {}", topic),
+                Ok(_) => tracing::debug!("zenoh put OK: {}", topic),
                 Err(e) => tracing::error!("zenoh put FAIL {}: {}", topic, e),
             }
         } else {
