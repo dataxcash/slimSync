@@ -165,7 +165,10 @@ impl Bus {
         }
     }
 
-    /// 处理一个文件：切片 → 逐块发送（携带段序号与段内偏移）。
+    /// 处理一个文件：流式切片 → 逐块发送（携带段序号与段内偏移）。
+    ///
+    /// 内存边界：不再一次性 `slice_file` 收集整段 `Vec<Chunk>`（峰值 ≈2×段大小），
+    /// 改为 `slice_file_iter` 有界窗口流式迭代，任何时刻只保留单个待发 chunk + 64KB 窗口。
     pub async fn process_file(
         &self,
         ledger: &Mutex<LocalLedger>,
@@ -175,23 +178,21 @@ impl Bus {
         tracing::info!("process_file: {} start={}", file_path, start_offset);
         let segment_seq = segment::parse_segment_seq(file_path).unwrap_or(0);
         let path = std::path::Path::new(file_path);
-        let chunks = slicer::slice_file(path, start_offset);
-        tracing::info!(
-            "process_file: {} seg={} -> {} chunks",
-            file_path,
-            segment_seq,
-            chunks.len()
-        );
+
         let mut last_offset = start_offset;
-        for chunk in &chunks {
+        let mut chunk_count: u64 = 0;
+        for chunk in slicer::slice_file_iter(path, start_offset) {
             let _blind_id = self
                 .send_chunk(ledger, file_path, &chunk.data, chunk.offset, segment_seq)
                 .await?;
             last_offset = chunk.offset + chunk.length;
+            chunk_count += 1;
         }
         tracing::info!(
-            "process_file: {} done, last_offset={}",
+            "process_file: {} seg={} -> {} chunks, last_offset={}",
             file_path,
+            segment_seq,
+            chunk_count,
             last_offset
         );
         Ok(last_offset)
