@@ -122,12 +122,8 @@ async fn run_foreground(config_path: Option<String>) {
         })
         .try_into()
         .unwrap_or([0u8; 32]);
-    let salt = std::fs::read(&cfg.crypto.salt_file).unwrap_or_else(|_| {
-        tracing::warn!("salt file not found, using default salt");
-        b"default-group-salt!".to_vec()
-    });
 
-    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, salt, cfg.dev_id).await);
+    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, cfg.dev_id).await);
     tracing::info!(
         "zenoh bus: {}",
         if bus.is_online() {
@@ -172,12 +168,8 @@ async fn run_daemon(config_path: Option<String>) {
         })
         .try_into()
         .unwrap_or([0u8; 32]);
-    let salt = std::fs::read(&cfg.crypto.salt_file).unwrap_or_else(|_| {
-        tracing::warn!("salt file not found, using default salt");
-        b"default-group-salt!".to_vec()
-    });
 
-    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, salt, cfg.dev_id).await);
+    let bus = Arc::new(bus::Bus::connect(&cfg.zenoh, key, cfg.dev_id).await);
     tracing::info!(
         "zenoh bus: {}",
         if bus.is_online() {

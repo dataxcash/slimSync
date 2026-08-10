@@ -22,7 +22,6 @@ pub struct WatchConfig {
 #[derive(Debug, Clone)]
 pub struct CryptoConfig {
     pub key_file: PathBuf,
-    pub salt_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -105,12 +104,6 @@ pub fn load(config_path: Option<String>) -> Result<Config, Box<dyn std::error::E
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/etc/slimsync/key.age")),
-            salt_file: raw
-                .get("crypto")
-                .and_then(|c| c.get("salt_file"))
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/etc/slimsync/salt.bin")),
         },
         storage: StorageConfig {
             db_path: raw
