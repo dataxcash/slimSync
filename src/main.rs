@@ -136,6 +136,7 @@ async fn run_foreground(config_path: Option<String>) {
             "offline (local-only)"
         }
     );
+    bus.spawn_gap_server(ledger.clone());
 
     run_cold_start(&ledger, &bus, &cfg.watch.dirs).await;
 
@@ -185,6 +186,7 @@ async fn run_daemon(config_path: Option<String>) {
             "offline (local-only)"
         }
     );
+    bus.spawn_gap_server(ledger.clone());
 
     run_cold_start(&ledger, &bus, &cfg.watch.dirs).await;
 

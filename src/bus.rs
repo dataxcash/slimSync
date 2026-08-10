@@ -1,7 +1,10 @@
+use std::sync::{Arc, Mutex};
+
 use zenoh::Session;
 
 use crate::config::ZenohConfig;
 use crate::crypto;
+use crate::ledger::LocalLedger;
 use crate::slicer;
 use crate::segment;
 
@@ -80,28 +83,78 @@ impl Bus {
             data.len(),
             cipher.len()
         );
-        let frame = slim_common::framing::encode_chunk_frame(
-            self.dev_id,
-            segment_seq,
-            offset,
-            data.len() as u32,
-            &cipher,
-            false,
-        );
-        if let Some(session) = &self.session {
-            let topic = format!(
-                "{}/{}",
-                slim_common::topics::CHUNK_PREFIX,
-                hex::encode(blind_id)
-            );
-            match session.put(&topic, frame).await {
-                Ok(_) => tracing::debug!("zenoh put OK: {}", topic),
-                Err(e) => tracing::error!("zenoh put FAIL {}: {}", topic, e),
+        publish_chunk(&self.session, &self.key, &self.salt, self.dev_id, data, offset, segment_seq).await
+    }
+
+    /// 段缺口回源自愈服务（接收端封盘发现 missing>0 时查询此服务重发缺口 chunk）。
+    ///
+    /// 现象→根因→方案：zenoh 会话内部有界缓冲在突发流量下间歇性丢帧（与去重/切片器/网络
+    /// 均无关，插桩实证 recv_frames<发送帧数、双端 tcpdump 字节一致、消费者 CPU 空闲）。
+    /// 影响：段封盘出现洞 → md5 对账失败。方案：接收端以 `GapQuery{dev,seg,start_offset}`
+    /// 查询本服务 → 本服务用同一 FastCDC 参数重读段文件、从 `start_offset` 重切片并重发
+    /// 缺口 chunk（帧头 (dev,seg,offset) 幂等落位）。`start_offset` 必为原 chunk 边界，
+    /// 因此重切片精确复现原边界，接收端连续回填直至封盘尺寸。
+    pub fn spawn_gap_server(&self, ledger: Arc<Mutex<LocalLedger>>) {
+        let Some(session) = self.session.clone() else {
+            tracing::warn!("gap server skipped: no zenoh session");
+            return;
+        };
+        let key = self.key;
+        let salt = self.salt.clone();
+        let dev_id = self.dev_id;
+        tokio::spawn(async move {
+            let Ok(queryable) = session
+                .declare_queryable(slim_common::topics::GAPS_PREFIX)
+                .await
+            else {
+                tracing::error!("gap server: declare_queryable failed");
+                return;
+            };
+            tracing::info!("gap server up: {}", slim_common::topics::GAPS_PREFIX);
+            while let Ok(query) = queryable.recv_async().await {
+                let payload: Vec<u8> = query
+                    .payload()
+                    .map(|p| p.to_bytes())
+                    .unwrap_or_default()
+                    .into();
+                let Some(gq) = slim_common::framing::decode_gap_query(&payload) else {
+                    continue;
+                };
+                let file_path = {
+                    let Ok(guard) = ledger.lock() else { continue };
+                    guard
+                        .get_segment(gq.segment_seq)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.file_path)
+                };
+                let reply = if let Some(fp) = file_path {
+                    let path = std::path::Path::new(&fp);
+                    if !path.exists() {
+                        "gone".to_string()
+                    } else {
+                        let mut resent: u64 = 0;
+                        for chunk in slicer::slice_file_iter(path, gq.start_offset) {
+                            let _ = publish_chunk(
+                                &Some(session.clone()),
+                                &key,
+                                &salt,
+                                dev_id,
+                                &chunk.data,
+                                chunk.offset,
+                                gq.segment_seq,
+                            )
+                            .await;
+                            resent += 1;
+                        }
+                        format!("resent={}", resent)
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                let _ = query.reply(query.key_expr().clone(), reply.into_bytes()).await;
             }
-        } else {
-            tracing::warn!("send_chunk: no zenoh session (local-only)");
-        }
-        Ok(blind_id)
+        });
     }
 
     /// 发布段封盘信号：slimSync 观察到段 N+1 创建（段 N 永不再追加）后调用，
@@ -152,4 +205,41 @@ impl Bus {
         );
         Ok(last_offset)
     }
+}
+
+/// 加密并发布一个 Chunk 数据帧（全量帧，`ref_only=false`）。
+/// 与 `send_chunk`/缺口回源共用，避免两处重复实现漂移。
+async fn publish_chunk(
+    session: &Option<Session>,
+    key: &[u8; 32],
+    salt: &[u8],
+    dev_id: u32,
+    data: &[u8],
+    offset: u64,
+    segment_seq: u32,
+) -> Result<[u8; 16], Box<dyn std::error::Error>> {
+    let blind_id = crypto::generate_blind_id(data, salt);
+    let cipher = crypto::encrypt_chunk(key, data);
+    let frame = slim_common::framing::encode_chunk_frame(
+        dev_id,
+        segment_seq,
+        offset,
+        data.len() as u32,
+        &cipher,
+        false,
+    );
+    if let Some(session) = session {
+        let topic = format!(
+            "{}/{}",
+            slim_common::topics::CHUNK_PREFIX,
+            hex::encode(blind_id)
+        );
+        match session.put(&topic, frame).await {
+            Ok(_) => tracing::debug!("zenoh put OK: {}", topic),
+            Err(e) => tracing::error!("zenoh put FAIL {}: {}", topic, e),
+        }
+    } else {
+        tracing::warn!("publish_chunk: no zenoh session (local-only)");
+    }
+    Ok(blind_id)
 }
