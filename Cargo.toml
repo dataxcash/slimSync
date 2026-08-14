@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # 共享契约
-slim-common = { path = "../slim-common" }
+slim-common = { git = "https://github.com/dataxcash/slim-common.git" }
 
 # 异步运行时
 tokio = { version = "1", features = ["full", "signal"] }

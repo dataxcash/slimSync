@@ -530,23 +530,19 @@ OS 内核事件流 (高频 Modify)
 
 ## 十一、接口契约：slim-common 共享 crate
 
-slimSync 与 slimHub / slimRagSvr 之间的通信类型和主题常量，由工作空间内的 `slim-common/` crate 单源定义。
+slimSync 与 slimHub / slimRagSvr 之间的通信类型和主题常量，由独立的 `slim-common` 仓库单源定义（git 依赖引入）。
 
 ```
-slimRAG/
-├── slim-common/        ← 三模块共享的 Rust crate
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       ├── types.rs    ← ChunkMessage, FileMetadata, AuditQuery 等 struct
-│       └── topics.rs   ← Zenoh 主题常量（编译期对齐）
-├── slimSync/           ← 依赖 slim-common
-├── slimHub/            ← 依赖 slim-common
-└── slimRagSvr/         ← 依赖 slim-common
+slim-common (独立仓库)
+├── Cargo.toml
+└── src/
+    ├── lib.rs
+    ├── types.rs    ← ChunkMessage, FileMetadata, AuditQuery 等 struct
+    └── topics.rs   ← Zenoh 主题常量（编译期对齐）
 ```
 
 - 序列化使用 `serde + postcard`，零外部工具链依赖
-- 任何字段或主题路径的修改，编辑 `slim-common/src/types.rs` / `topics.rs` 即可
+- 任何字段或主题路径的修改，编辑 slim-common 仓库的 `src/types.rs` / `topics.rs` 即可
 - 三模块修改后立即编译报错，保证编译期字段绝对对齐
 
 ---
