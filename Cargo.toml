@@ -2,6 +2,7 @@
 name = "slimsync"
 version = "0.1.0"
 edition = "2021"
+description = "Edge file-sync agent: blind, incremental, encrypted file sync (dual-track AST+CDC slicing, ChaCha20, Blind-ID dedup, offline SQLite ledger, Zenoh transport)"
 
 [dependencies]
 # 共享契约
